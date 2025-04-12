@@ -55,6 +55,7 @@ static const struct {
 #endif
     {0x11, {0}, 0x80},    //Exit Sleep
     {0x29, {0}, 0x80},    //Display on
+    {0x21, {0}, 0x80},    //Invert colors
 };
 
 

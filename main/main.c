@@ -1205,9 +1205,10 @@ static void start_normal(void)
     int queuedBtn = -1;
 
     nvs_flash_init_partition(MFW_NVS_PARTITION);
-    if (nvs_open("settings", NVS_READWRITE, &nvs_h) != ESP_OK) {
-        nvs_flash_erase();
-        nvs_open("settings", NVS_READWRITE, &nvs_h);
+    if (nvs_open_from_partition(MFW_NVS_PARTITION, "settings", NVS_READWRITE, &nvs_h) != ESP_OK) {
+        nvs_flash_erase_partition(MFW_NVS_PARTITION);
+        nvs_flash_init_partition(MFW_NVS_PARTITION);
+        nvs_open_from_partition(MFW_NVS_PARTITION, "settings", NVS_READWRITE, &nvs_h);
     }
     nvs_get_i32(nvs_h, "display_order", &displayOrder);
 

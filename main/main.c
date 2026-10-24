@@ -14,8 +14,10 @@
 
 #if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 4
 #include <esp32/rom/crc.h>
+#include <esp32/rom/md5_hash.h>
 #else
 #include <rom/crc.h>
+#include <rom/md5_hash.h>
 #endif
 
 #include <string.h>
@@ -489,6 +491,20 @@ static void write_partition_table(const odroid_app_t *app)
 
             ESP_LOGI(__func__, "Added partition #%d '%s'", nextPart - 1, part->label);
         }
+    }
+
+    // Append the MD5 entry, apps built with CONFIG_PARTITION_TABLE_MD5 (eg. esp-idf 4.4+) refuse a table without it
+    if (nextPart < ESP_PARTITION_TABLE_MAX_ENTRIES)
+    {
+        uint8_t *md5_entry = (uint8_t *)&partitionTable[nextPart];
+        struct MD5Context context;
+
+        memset(md5_entry, 0xFF, sizeof(esp_partition_info_t));
+        *(uint16_t *)md5_entry = ESP_PARTITION_MAGIC_MD5;
+        MD5Init(&context);
+        MD5Update(&context, (unsigned char *)partitionTable, nextPart * sizeof(esp_partition_info_t));
+        MD5Final(md5_entry + 16, &context);
+        nextPart++;
     }
 
     // We must fill the rest with 0xFF, the boot loader checks magic = 0xFFFF, type = 0xFF, subtype = 0xFF

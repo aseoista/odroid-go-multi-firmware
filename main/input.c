@@ -94,6 +94,11 @@ uint32_t input_read_raw(void)
     return state;
 }
 
+uint32_t input_get_state(void)
+{
+    return gamepad_state;
+}
+
 int input_wait_for_button_press(int ticks)
 {
     uint32_t previousState = gamepad_state;

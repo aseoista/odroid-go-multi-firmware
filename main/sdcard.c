@@ -39,6 +39,8 @@ extern void ff_diskio_register_sdmmc(unsigned char pdrv, sdmmc_card_t* card);
 #endif
 
 
+static BYTE sdcard_drive = 0;
+
 inline static void swap(char** a, char** b)
 {
     char* t = *a;
@@ -159,7 +161,16 @@ esp_err_t odroid_sdcard_open(void)
         .max_files = 5,
     };
 
+    // esp_vfs_fat_sdmmc_mount() takes the first free FatFs drive, remember it for direct FatFs calls
+    BYTE drive = 0xFF;
+    bool found = ff_diskio_get_drive(&drive) == ESP_OK && drive != 0xFF;
+
     esp_err_t ret = esp_vfs_fat_sdmmc_mount(SDCARD_BASE_PATH, &host_config, &slot_config, &mount_config, NULL);
+
+    if (ret == ESP_OK && found)
+    {
+        sdcard_drive = drive;
+    }
 
     if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE)
     {
@@ -183,6 +194,11 @@ esp_err_t odroid_sdcard_close(void)
     }
 
     return ret;
+}
+
+int odroid_sdcard_get_drive(void)
+{
+    return sdcard_drive;
 }
 
 esp_err_t odroid_sdcard_format(int fs_type)

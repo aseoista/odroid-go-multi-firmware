@@ -26,6 +26,7 @@
 #include "sdcard.h"
 #include "display.h"
 #include "input.h"
+#include "usbxfer.h"
 
 #include "ugui/ugui.h"
 
@@ -58,6 +59,8 @@
 #define BATTERY_VMIN                (3.30f)
 
 #define ITEM_COUNT                  ((SCREEN_HEIGHT-32)/52)
+
+#define HOST_REQUEST                (-2) // Returned by wait_for_input when the PC starts a transfer session
 
 #define ALIGN_ADDRESS(val, alignment) (((val & (alignment-1)) != 0) ? (val & ~(alignment-1)) + alignment : val)
 #define SET_STATUS_LED(on) gpio_set_level(GPIO_NUM_2, on);
@@ -554,6 +557,51 @@ static void boot_application(odroid_app_t *app)
 }
 
 
+// Removes an app from the app table, its flash space becomes free for the next install
+static void erase_app(odroid_app_t *app)
+{
+    bool in_use = false;
+
+    // The partition table still points at the last booted app: if it's this one, drop it so that
+    // "reboot" doesn't start whatever gets installed there next.
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    for (; it != NULL; it = esp_partition_next(it))
+    {
+        const esp_partition_t *part = esp_partition_get(it);
+        if (part->address >= app->startOffset && part->address <= app->endOffset)
+            in_use = true;
+    }
+    esp_partition_iterator_release(it);
+
+    memmove(app, app + 1, (apps_count - (app - apps) - 1) * sizeof(odroid_app_t));
+    apps_count--;
+    write_app_table();
+
+    if (in_use)
+        write_partition_table(NULL);
+}
+
+
+static esp_err_t erase_app_nvs(const odroid_app_t *app)
+{
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    size_t offset = app->startOffset;
+
+    for (int i = 0; i < app->parts_count; i++)
+    {
+        const odroid_partition_t *part = &app->parts[i];
+        if (part->type == ESP_PARTITION_TYPE_DATA && part->subtype == ESP_PARTITION_SUBTYPE_DATA_NVS)
+        {
+            if ((err = spi_flash_erase_range(offset, part->length)) != ESP_OK)
+                break;
+        }
+        offset += part->length;
+    }
+
+    return err;
+}
+
+
 static void defrag_flash(void)
 {
     size_t nextStartOffset = firstAppOffset;
@@ -768,41 +816,51 @@ static odroid_fw_t *firmware_get_info(const char *filename)
 
 firmware_get_info_err:
     free(outData);
-    fclose(file);
+    if (file) fclose(file);
     return NULL;
 }
 
 
-static void flash_firmware(const char *fullPath)
+// Installs a .fw file. Returns NULL on success (*appOut is set) or an error message (*appOut is NULL).
+// In interactive mode the user confirms with START (cancelling also returns NULL) and errors wait for B.
+static const char *install_firmware(const char *fullPath, bool interactive, odroid_app_t **appOut)
 {
-    odroid_app_t *app = memset(&apps[apps_count], 0x00, sizeof(*app));
-    odroid_fw_t *fw = firmware_get_info(fullPath);
-    void *dataBuffer = safe_alloc(FLASH_BLOCK_SIZE);
+    odroid_app_t *app = &apps[apps_count];
+    odroid_fw_t *fw = NULL;
+    void *dataBuffer = NULL;
+    FILE *file = NULL;
+    const char *error = NULL;
     char tempstring[128];
+
+    *appOut = NULL;
 
     ESP_LOGI(__func__, "Flashing file: %s", fullPath);
 
     sort_app_table(LIST_SORT_OFFSET);
     DisplayPage("Install Application", "Destination: Pending");
-    DisplayFooter("[B] Go Back");
+    DisplayFooter(interactive ? "[B] Go Back" : "");
     UpdateDisplay();
     SET_STATUS_LED(0);
 
-    if (!fw)
+    if (apps_count >= apps_max)
     {
-        DisplayError("INVALID FIRMWARE FILE"); // To do: Make it show what is invalid
-        while (input_wait_for_button_press(-1) != ODROID_INPUT_B);
-        free(dataBuffer), free(fw);
-        return;
+        error = "APP TABLE FULL";
+        goto _cleanup;
+    }
+
+    memset(app, 0x00, sizeof(*app));
+
+    if (!(fw = firmware_get_info(fullPath)))
+    {
+        error = "INVALID FIRMWARE FILE"; // To do: Make it show what is invalid
+        goto _cleanup;
     }
 
     int currentFlashAddress = find_free_block(fw->flashSize, true);
     if (currentFlashAddress == -1)
     {
-        DisplayError("NOT ENOUGH FREE SPACE");
-        while (input_wait_for_button_press(-1) != ODROID_INPUT_B);
-        free(dataBuffer), free(fw);
-        return;
+        error = "NOT ENOUGH FREE SPACE";
+        goto _cleanup;
     }
 
     strncpy(app->description, fw->header.description, sizeof(app->description)-1);
@@ -817,8 +875,11 @@ static void flash_firmware(const char *fullPath)
     sprintf(tempstring, "Destination: 0x%x", currentFlashAddress);
     DisplayPage("Install Application", tempstring);
     DisplayHeader(app->description);
-    DisplayMessage("[START]");
-    DisplayFooter("[B] Cancel");
+    if (interactive)
+    {
+        DisplayMessage("[START]");
+        DisplayFooter("[B] Cancel");
+    }
 
     int tileLeft = (SCREEN_WIDTH / 2) - (FIRMWARE_TILE_WIDTH / 2);
     int tileTop = (16 + 16 + 16);
@@ -830,11 +891,11 @@ static void flash_firmware(const char *fullPath)
     UG_DrawFrame(tileLeft - 1, tileTop - 1, tileLeft + FIRMWARE_TILE_WIDTH, tileTop + FIRMWARE_TILE_HEIGHT, C_BLACK);
     UpdateDisplay();
 
-    while (1)
+    while (interactive)
     {
         int btn = input_wait_for_button_press(-1);
         if (btn == ODROID_INPUT_START) break;
-        if (btn == ODROID_INPUT_B) return;
+        if (btn == ODROID_INPUT_B) goto _cleanup;
     }
 
     DisplayMessage("Verifying ...");
@@ -843,30 +904,35 @@ static void flash_firmware(const char *fullPath)
 
     SET_STATUS_LED(1);
 
-    FILE *file = fopen(fullPath, "rb");
-    if (file == NULL)
+    dataBuffer = safe_alloc(FLASH_BLOCK_SIZE);
+
+    if (!(file = fopen(fullPath, "rb")))
     {
-        panic_abort("FILE OPEN ERROR");
+        error = "FILE OPEN ERROR";
+        goto _cleanup;
     }
 
+    // The checksum covers everything but itself (the last 4 bytes)
     uint32_t checksum = 0;
-    while (true)
+    size_t remaining = fw->fileSize - sizeof(fw->checksum);
+    while (remaining > 0)
     {
-        size_t count = fread(dataBuffer, 1, FLASH_BLOCK_SIZE, file);
-        if (ftell(file) == fw->fileSize)
+        size_t count = fread(dataBuffer, 1, RG_MIN(remaining, FLASH_BLOCK_SIZE), file);
+        if (count == 0)
         {
-            count -= 4;
+            error = "DATA READ ERROR";
+            goto _cleanup;
         }
 
         checksum = crc32_le(checksum, dataBuffer, count);
-
-        if (count < FLASH_BLOCK_SIZE) break;
+        remaining -= count;
     }
 
     if (checksum != fw->checksum)
     {
         ESP_LOGE(__func__, "Checksum mismatch: expected: %#010x, computed:%#010x", fw->checksum, checksum);
-        panic_abort("CHECKSUM MISMATCH ERROR");
+        error = "CHECKSUM MISMATCH ERROR";
+        goto _cleanup;
     }
     ESP_LOGI(__func__, "Checksum OK: %#010x", checksum);
 
@@ -876,7 +942,7 @@ static void flash_firmware(const char *fullPath)
     app->magic = APP_TABLE_MAGIC;
     app->startOffset = currentFlashAddress;
 
-    // Copy the firmware
+    // Copy the firmware. Nothing is committed until the app table is written, so bailing out is safe.
     for (int i = 0; i < app->parts_count; i++)
     {
         odroid_partition_t *slot = &app->parts[i];
@@ -899,7 +965,8 @@ static void flash_firmware(const char *fullPath)
         if (spi_flash_erase_range(currentFlashAddress, eraseBlocks * ERASE_BLOCK_SIZE) != ESP_OK)
         {
             ESP_LOGE(__func__, "spi_flash_erase_range failed. eraseBlocks=%d", eraseBlocks);
-            panic_abort("ERASE ERROR");
+            error = "ERASE ERROR";
+            goto _cleanup;
         }
 
         if (slot->dataLength > 0)
@@ -921,7 +988,8 @@ static void flash_firmware(const char *fullPath)
                 size_t count = fread(dataBuffer, 1, FLASH_BLOCK_SIZE, file);
                 if (count <= 0)
                 {
-                    panic_abort("DATA READ ERROR");
+                    error = "DATA READ ERROR";
+                    goto _cleanup;
                 }
 
                 if (offset + count >= slot->dataLength)
@@ -931,10 +999,11 @@ static void flash_firmware(const char *fullPath)
 
                 // flash
                 if (spi_flash_write(currentFlashAddress + offset, dataBuffer, count) != ESP_OK)
-        		{
-        			ESP_LOGE(__func__, "spi_flash_write failed. address=%#08x", currentFlashAddress + offset);
-                    panic_abort("WRITE ERROR");
-        		}
+                {
+                    ESP_LOGE(__func__, "spi_flash_write failed. address=%#08x", currentFlashAddress + offset);
+                    error = "WRITE ERROR";
+                    goto _cleanup;
+                }
 
                 totalCount += count;
             }
@@ -944,7 +1013,8 @@ static void flash_firmware(const char *fullPath)
             if (totalCount != slot->dataLength)
             {
                 ESP_LOGE(__func__, "Size mismatch: length=%#08x, totalCount=%#08x", slot->dataLength, totalCount);
-                panic_abort("DATA SIZE ERROR");
+                error = "DATA SIZE ERROR";
+                goto _cleanup;
             }
 
             fseek(file, nextEntry, SEEK_SET);
@@ -956,10 +1026,6 @@ static void flash_firmware(const char *fullPath)
         currentFlashAddress += slot->length;
     }
 
-    fclose(file);
-    free(fw);
-    free(dataBuffer);
-
     // 64K align our endOffset
     app->endOffset = ALIGN_ADDRESS(currentFlashAddress, FLASH_BLOCK_SIZE) - 1;
 
@@ -969,6 +1035,34 @@ static void flash_firmware(const char *fullPath)
     // Write app table
     apps_count++; // Everything went well, acknowledge the new app
     write_app_table();
+
+    *appOut = app;
+
+_cleanup:
+    SET_STATUS_LED(0);
+
+    if (file) fclose(file);
+    free(dataBuffer);
+    free(fw);
+
+    if (error)
+    {
+        ESP_LOGE(__func__, "Install failed: %s", error);
+        DisplayError(error);
+        if (interactive)
+            while (input_wait_for_button_press(-1) != ODROID_INPUT_B);
+    }
+
+    return error;
+}
+
+
+static void flash_firmware(const char *fullPath)
+{
+    odroid_app_t *app;
+
+    if (install_firmware(fullPath, true, &app) || !app)
+        return;
 
     DisplayMessage("Ready !");
     DisplayFooter("[B] Go Back  |  [A] Boot");
@@ -1159,6 +1253,88 @@ static int ui_choose_dialog(dialog_option_t *options, int optionCount, bool canc
     return -1;
 }
 
+static odroid_app_t *usbxfer_installed_app;
+
+static void usbxfer_status(const char *header, const char *message, int percent)
+{
+    DisplayPage("USB File Transfer", "[B] Exit");
+    DisplayHeader(header);
+    if (percent >= 0)
+        DisplayProgress(percent);
+    DisplayMessage(message);
+}
+
+static const char *usbxfer_install(const char *path)
+{
+    return install_firmware(path, false, &usbxfer_installed_app);
+}
+
+static int usbxfer_list_apps(usbxfer_app_t *out, int max)
+{
+    int count = RG_MIN(apps_count, max);
+
+    for (int i = 0; i < count; i++)
+    {
+        out[i].start = apps[i].startOffset;
+        out[i].end = apps[i].endOffset;
+        out[i].seq = apps[i].installSeq;
+        snprintf(out[i].description, sizeof(out[i].description), "%.39s", apps[i].description);
+        snprintf(out[i].filename, sizeof(out[i].filename), "%.39s", apps[i].filename);
+    }
+
+    return count;
+}
+
+static const char *usbxfer_erase_app(uint32_t start, bool nvs_only)
+{
+    for (int i = 0; i < apps_count; i++)
+    {
+        if (apps[i].startOffset != start)
+            continue;
+        if (nvs_only)
+            return erase_app_nvs(&apps[i]) == ESP_OK ? NULL : "NVS ERASE ERROR";
+        erase_app(&apps[i]);
+        return NULL;
+    }
+
+    return "APP NOT FOUND";
+}
+
+static void start_usbxfer(bool host_started)
+{
+    static const usbxfer_hooks_t hooks = {
+        .status = usbxfer_status,
+        .install = usbxfer_install,
+        .list_apps = usbxfer_list_apps,
+        .erase_app = usbxfer_erase_app,
+    };
+
+    usbxfer_installed_app = NULL;
+
+    if (usbxfer_run(&hooks, host_started) == USBXFER_BOOT_INSTALLED && usbxfer_installed_app)
+    {
+        DisplayPage("MULTI-FIRMWARE", PROJECT_VER);
+        boot_application(usbxfer_installed_app);
+    }
+}
+
+// Wait for a button press, like input_wait_for_button_press, but also return HOST_REQUEST
+// if the PC starts a transfer session.
+static int wait_for_input(int ticks)
+{
+    TickType_t timeout = xTaskGetTickCount() + ticks;
+
+    do {
+        int btn = input_wait_for_button_press(pdMS_TO_TICKS(50));
+        if (btn != -1)
+            return btn;
+        if (usbxfer_host_detected())
+            return HOST_REQUEST;
+    } while ((int32_t)(timeout - xTaskGetTickCount()) > 0);
+
+    return -1;
+}
+
 static void ui_draw_app_page(int currentItem)
 {
     int page = (currentItem / ITEM_COUNT) * ITEM_COUNT;
@@ -1198,6 +1374,8 @@ static void start_normal(void)
     read_app_table();
     sort_app_table(displayOrder);
 
+    usbxfer_init();
+
     while (true)
     {
         ui_draw_app_page(currentItem);
@@ -1205,8 +1383,16 @@ static void start_normal(void)
         int page = (currentItem / ITEM_COUNT) * ITEM_COUNT;
 
         // Wait for input but refresh display after 1000 ticks if no input
-        int btn = (queuedBtn != -1) ? queuedBtn : input_wait_for_button_press(1000);
+        int btn = (queuedBtn != -1) ? queuedBtn : wait_for_input(1000);
         queuedBtn = -1;
+
+        if (btn == HOST_REQUEST)
+        {
+            start_usbxfer(true);
+            sort_app_table(displayOrder);
+            currentItem = RG_MAX(0, RG_MIN(currentItem, apps_count - 1));
+            continue;
+        }
 
 		if (apps_count > 0)
 		{
@@ -1260,6 +1446,7 @@ static void start_normal(void)
         {
             dialog_option_t options[] = {
                 {0, "Install from SD Card", true},
+                {6, "USB File Transfer", true},
                 {1, "Erase selected app", apps_count > 0},
                 {2, "Erase selected NVS", apps_count > 0},
                 {3, "Erase all apps", apps_count > 0},
@@ -1269,9 +1456,8 @@ static void start_normal(void)
 
             odroid_app_t *app = &apps[currentItem];
             char *fileName;
-            size_t offset;
 
-            switch (ui_choose_dialog(options, 6, true))
+            switch (ui_choose_dialog(options, 7, true))
             {
                 case 0: // Install from SD Card
                     if ((fileName = ui_choose_file(FIRMWARE_PATH))) {
@@ -1280,24 +1466,13 @@ static void start_normal(void)
                     }
                     break;
                 case 1: // Remove selected app
-                    memmove(app, app + 1, (apps_max - currentItem) * sizeof(odroid_app_t));
-                    apps_count--;
-                    write_app_table();
+                    erase_app(app);
                     break;
                 case 2: // Erase selected app's NVS
-                    offset = app->startOffset;
-                    for (int i = 0; i < app->parts_count; i++)
-                    {
-                        odroid_partition_t *part = &app->parts[i];
-                        if (part->type == 1 && part->subtype == ESP_PARTITION_SUBTYPE_DATA_NVS)
-                        {
-                            if (spi_flash_erase_range(offset, part->length) == ESP_OK)
-                                DisplayNotification("Operation successful!");
-                            else
-                                DisplayNotification("An error has occurred!");
-                        }
-                        offset += part->length;
-                    }
+                    if (erase_app_nvs(app) == ESP_OK)
+                        DisplayNotification("Operation successful!");
+                    else
+                        DisplayNotification("An error has occurred!");
                     queuedBtn = input_wait_for_button_press(200);
                     break;
                 case 3: // Erase all apps
@@ -1333,9 +1508,13 @@ static void start_normal(void)
                 case 5: // Restart
                     cleanup_and_restart();
                     break;
+                case 6: // USB File Transfer
+                    start_usbxfer(false);
+                    break;
             }
 
             sort_app_table(displayOrder);
+            currentItem = RG_MAX(0, RG_MIN(currentItem, apps_count - 1));
         }
         else if (btn == ODROID_INPUT_B)
         {

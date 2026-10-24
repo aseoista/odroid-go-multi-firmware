@@ -26,6 +26,30 @@ Follow these instructions: https://wiki.odroid.com/odroid_go/firmware_update but
 _Note: If you are familiar with esptool, you just have to flash `odroid-go-multi-firmware-XXX.fw` to offset 0x0._
 
 
+# USB file transfer
+While the boot menu is shown, you can access the SD card from a PC over the USB cable with `tools/sdxfer.py` (requires `pip install pyserial`). The device switches to transfer mode by itself when the tool connects and goes back to the menu when it is done. You can also open it from MENU > USB File Transfer, and press B to leave it.
+
+```
+python tools/sdxfer.py info                                   # device, firmware and SD card info
+python tools/sdxfer.py ls -l /roms/nes                        # list a directory
+python tools/sdxfer.py put game.nes /roms/nes                 # upload (put -r for directories)
+python tools/sdxfer.py get -r /retro-go/saves ./backup        # download
+python tools/sdxfer.py put -r --skip ./roms /                 # only upload files missing on the card
+python tools/sdxfer.py rm /roms/nes/game.nes                  # also: mkdir [-p], rmdir, mv, df
+python tools/sdxfer.py install --boot app.fw                  # upload, install and boot a .fw, no button press
+python tools/sdxfer.py apps                                   # list installed apps
+python tools/sdxfer.py erase 2                                # remove an app (number, name or .fw file name)
+python tools/sdxfer.py erase --nvs "OGO Keyboard"             # only erase an app's saved settings (NVS)
+python tools/sdxfer.py menu                                   # reboot into the boot menu (requires esptool)
+```
+
+- The port defaults to `/dev/ttyUSB0`, use `-p` or the `SDXFER_PORT` environment variable to change it.
+- The fastest reliable speed (up to 2 Mbaud) is negotiated automatically, CH34x USB chips for example end up at 1.5 Mbaud. Expect 100-150 KB/s, it's best for ROMs, saves and firmware rather than whole collections.
+- Uploads are written to a `.part` file and renamed once verified, an interrupted transfer never leaves a damaged file.
+- Paths are relative to the card root and must be plain ASCII. Files with other names are skipped with a warning.
+- `menu` erases otadata, like holding B at power-up. It needs a board with the usual DTR/RTS auto-reset circuit.
+
+
 # Compilation
 The official esp-idf version 3.1 or newer is required and to improve SD Card support you should this patch:
 

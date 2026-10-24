@@ -20,4 +20,5 @@ enum
 
 void input_init(void);
 uint32_t input_read_raw();
+uint32_t input_get_state(void);
 int input_wait_for_button_press(int ticks);
